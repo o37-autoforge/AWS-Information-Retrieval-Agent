@@ -6,73 +6,11 @@ from botocore.exceptions import ClientError
 
 def create_iam_roles():
     iam = boto3.client('iam')
-    
-    # Create role for AWS Config
-    config_role_name = 'AWSConfigRole'
-    config_trust_policy = {
-        "Version": "2012-10-17",
-        "Statement": [
-            {
-                "Effect": "Allow",
-                "Principal": {
-                    "Service": "config.amazonaws.com"
-                },
-                "Action": "sts:AssumeRole"
-            }
-        ]
-    }
-    
-    try:
-        iam.create_role(
-            RoleName=config_role_name,
-            AssumeRolePolicyDocument=json.dumps(config_trust_policy)
-        )
-        iam.attach_role_policy(
-            RoleName=config_role_name,
-            PolicyArn='arn:aws:iam::aws:policy/service-role/AWSConfigRole'
-        )
-        print(f"Created IAM role: {config_role_name}")
-    except ClientError as e:
-        if e.response['Error']['Code'] == 'EntityAlreadyExists':
-            print(f"IAM role {config_role_name} already exists")
-        else:
-            raise
-
-    # Create role for Firehose
-    firehose_role_name = 'FirehoseDeliveryRole'
-    firehose_trust_policy = {
-        "Version": "2012-10-17",
-        "Statement": [
-            {
-                "Effect": "Allow",
-                "Principal": {
-                    "Service": "firehose.amazonaws.com"
-                },
-                "Action": "sts:AssumeRole"
-            }
-        ]
-    }
-    
-    try:
-        iam.create_role(
-            RoleName=firehose_role_name,
-            AssumeRolePolicyDocument=json.dumps(firehose_trust_policy)
-        )
-        iam.attach_role_policy(
-            RoleName=firehose_role_name,
-            PolicyArn='arn:aws:iam::aws:policy/service-role/AWSConfigRoleForOrganizations'
-        )
-        print(f"Created IAM role: {firehose_role_name}")
-    except ClientError as e:
-        if e.response['Error']['Code'] == 'EntityAlreadyExists':
-            print(f"IAM role {firehose_role_name} already exists")
-        else:
-            raise
 
 def create_cloudformation_template():
     template = {
         "AWSTemplateFormatVersion": "2010-09-09",
-        "Description": "AWS Config to Redshift Pipeline",
+        "Description": "AWS Config to Redshift Pipeline with Enhanced Data Collection",
         "Resources": {
             "AWSConfigBucket": {
                 "Type": "AWS::S3::Bucket",
@@ -103,6 +41,76 @@ def create_cloudformation_template():
                             "Prefix": "firehose/"
                         }
                     }
+                }
+            },
+            "CloudWatchLogsSubscriptionFilter": {
+                "Type": "AWS::Logs::SubscriptionFilter",
+                "Properties": {
+                    "DestinationArn": {"Fn::GetAtt": ["FirehoseDeliveryStream", "Arn"]},
+                    "FilterPattern": "",
+                    "LogGroupName": "/aws/lambda/example-function"
+                }
+            },
+            "AMICollectorLambda": {
+                "Type": "AWS::Lambda::Function",
+                "Properties": {
+                    "FunctionName": "AMICollector",
+                    "Handler": "index.handler",
+                    "Role": {"Fn::GetAtt": ["LambdaExecutionRole", "Arn"]},
+                    "Code": {
+                        "ZipFile": {
+                            "Fn::Join": ["\n", [
+                                "import boto3",
+                                "import json",
+                                "def handler(event, context):",
+                                "    ec2 = boto3.client('ec2')",
+                                "    response = ec2.describe_images(Owners=['self'])",
+                                "    return json.dumps(response['Images'])"
+                            ]]
+                        }
+                    },
+                    "Runtime": "python3.8",
+                    "Timeout": 30
+                }
+            },
+            "ServiceQuotasCollectorLambda": {
+                "Type": "AWS::Lambda::Function",
+                "Properties": {
+                    "FunctionName": "ServiceQuotasCollector",
+                    "Handler": "index.handler",
+                    "Role": {"Fn::GetAtt": ["LambdaExecutionRole", "Arn"]},
+                    "Code": {
+                        "ZipFile": {
+                            "Fn::Join": ["\n", [
+                                "import boto3",
+                                "import json",
+                                "def handler(event, context):",
+                                "    quotas = boto3.client('service-quotas')",
+                                "    response = quotas.list_service_quotas(ServiceCode='ec2')",
+                                "    return json.dumps(response['Quotas'])"
+                            ]]
+                        }
+                    },
+                    "Runtime": "python3.8",
+                    "Timeout": 30
+                }
+            },
+            "LambdaExecutionRole": {
+                "Type": "AWS::IAM::Role",
+                "Properties": {
+                    "AssumeRolePolicyDocument": {
+                        "Version": "2012-10-17",
+                        "Statement": [{
+                            "Effect": "Allow",
+                            "Principal": {"Service": ["lambda.amazonaws.com"]},
+                            "Action": ["sts:AssumeRole"]
+                        }]
+                    },
+                    "ManagedPolicyArns": [
+                        "arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole",
+                        "arn:aws:iam::aws:policy/AmazonEC2ReadOnlyAccess",
+                        "arn:aws:iam::aws:policy/ServiceQuotasReadOnlyAccess"
+                    ]
                 }
             }
         },
@@ -145,6 +153,63 @@ def deploy_cloudformation_stack(stack_name, template_file, parameters):
     except ClientError as e:
         print(f"Error creating CloudFormation stack: {e}")
 
+def create_redshift_tables():
+    redshift = boto3.client('redshift-data')
+    cluster_identifier = 'your-redshift-cluster-identifier'
+    database = 'your-redshift-database'
+    db_user = 'your-redshift-username'
+
+    sql_commands = """
+    CREATE TABLE IF NOT EXISTS cloudwatch_logs (
+        log_group VARCHAR(255),
+        log_stream VARCHAR(255),
+        timestamp TIMESTAMP,
+        message TEXT
+    );
+
+    CREATE TABLE IF NOT EXISTS ami_details (
+        ami_id VARCHAR(255),
+        name VARCHAR(255),
+        description TEXT,
+        creation_date TIMESTAMP,
+        owner_id VARCHAR(255)
+    );
+
+    CREATE TABLE IF NOT EXISTS quota_details (
+        service VARCHAR(255),
+        quota_name VARCHAR(255),
+        quota_value FLOAT,
+        used FLOAT,
+        unit VARCHAR(50)
+    );
+
+    CREATE TABLE IF NOT EXISTS service_limits (
+        service VARCHAR(255),
+        limit_name VARCHAR(255),
+        limit_value FLOAT,
+        unit VARCHAR(50)
+    );
+
+    CREATE TABLE IF NOT EXISTS cost_usage_reports (
+        time_period VARCHAR(50),
+        service VARCHAR(255),
+        cost FLOAT,
+        usage FLOAT,
+        unit VARCHAR(50)
+    );
+    """
+
+    try:
+        response = redshift.execute_statement(
+            ClusterIdentifier=cluster_identifier,
+            Database=database,
+            DbUser=db_user,
+            Sql=sql_commands
+        )
+        print("Redshift tables created successfully")
+    except ClientError as e:
+        print(f"Error creating Redshift tables: {e}")
+
 def main():
     # Create IAM roles
     create_iam_roles()
@@ -162,10 +227,10 @@ def main():
     ]
     deploy_cloudformation_stack(stack_name, template_file, parameters)
     
-    # Run the schema creation script
-    subprocess.run(['python', 'aws_config_schema_design.py'])
+    # Create expanded set of tables in Redshift
+    create_redshift_tables()
     
-    print("AWS Config to database pipeline setup completed")
+    print("AWS Config to database pipeline setup completed with enhanced data collection")
 
 if __name__ == "__main__":
     main()
